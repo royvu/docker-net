@@ -1,0 +1,181 @@
+#!/bin/sh
+#Another Docker network helper
+
+GUESTNAME=$1
+COMMAND=$2
+
+help() {
+  echo "Syntax:"
+  echo "$0 <container-name> route"
+  echo "$0 <container-name> route \"<ip route command>\""
+  echo "$0 <container-name> cmd \"<nsenter command>\""
+  echo "$0 <container-name> ping <host>"
+  echo "$0 <container-name> ip"
+  echo "$0 <container-name> ip <network>"
+  echo "$0 <container-name> ip <network> del"
+  echo "$0 <container-name> ip <network> flush"
+  echo "$0 <container-name> ip <network> <ip/sub>"
+  echo "$0 <container-name> ip <network> <ip/sub> del"
+  exit 1
+}
+
+installed () {
+  command -v "$1" >/dev/null 2>&1
+}
+
+die () {
+  status="$1"
+  shift
+  echo "$@"
+  exit "$status"
+}
+
+[ "$GUESTNAME" ] || help
+[ "$COMMAND" = "ip" ] || [ "$COMMAND" = "route" ] || [ "$COMMAND" = "ping" ] || [ "$COMMAND" = "cmd" ] || help
+
+# get docker pid
+DOCKERPID=0
+if installed docker; then
+  TMP=$(docker ps -f "name=$GUESTNAME" | wc -l)
+
+  [ "$TMP" = 1 ] && {
+    die 1 "Container "$GUESTNAME" not found"
+  }
+
+  RETRIES=3
+  while [ "$RETRIES" -gt 0 ]; do
+    DOCKERPID=$(docker inspect --format='{{ .State.Pid }}' "$GUESTNAME")
+    [ "$DOCKERPID" != 0 ] && break
+    sleep 1
+    RETRIES=$((RETRIES - 1))
+  done
+
+  [ "$DOCKERPID" = 0 ] && {
+    die 1 "Docker inspect returned invalid PID 0"
+  }
+
+  [ "$DOCKERPID" = "<no value>" ] && {
+    die 1 "Container "$GUESTNAME" not found, and unknown to Docker."
+  }
+else
+  die 1 "Container "$GUESTNAME" not found, and Docker not installed."
+fi
+NSENTER="nsenter -t $DOCKERPID -m -n "
+# do job <container-name> ping <host>
+[ "$COMMAND" = "ping" ] && {
+  [ "$3" = "" ] && {
+    die 1 "Miss target host"
+  }
+  CMD="ping -c 1 $3"
+  $NSENTER $CMD
+  exit 0
+}
+
+# do job <container-name> ip or <container-name> route
+[ "$3" = "" ] && {
+  if [ "$COMMAND" = "route" ]; then
+    $NSENTER ip route
+  else
+    $NSENTER ip addr 
+  fi
+  exit 0
+}
+
+# do job <container-name> route "<ip route command>"
+[ "$COMMAND" = "route" ] && {
+  CMD="ip route $3"
+  $NSENTER $CMD
+  exit 0
+}
+
+# do job <container-name> cmd "<command>"
+[ "$COMMAND" = "cmd" ] && {
+  $NSENTER $3
+  exit 0
+}
+
+# get docker network
+DOCKER_NET=$3
+TMP=$(docker network ls -f "name=$DOCKER_NET" | wc -l)
+[ "$TMP" = 1 ] && {
+  die 1 "Docker network "$DOCKER_NET" not found"
+}
+
+# check is connectd
+guest_mac() {
+  RETRIES=3
+  IFMAC=0
+  TYPE=$(docker network inspect -f {{.Driver}} $1)
+  
+  if [ "$TYPE" = "ipvlan" ]; then
+    HOSTIF=$(docker network inspect -f {{.Options.parent}} "$DOCKER_NET")
+    MAC=$(ip -o link show $HOSTIF | awk -F 'ether' '{print $2}' | awk '{print $1}')
+    TMP=$($NSENTER ip -o link | grep "$MAC")
+    [ "$TMP" != "" ] && IFMAC=$MAC
+  fi
+  
+  if [ "$TYPE" = "macvlan" ]; then
+    while [ "$RETRIES" -gt 0 ]; do
+      TMP="{{.NetworkSettings.Networks.$1.MacAddress}} $2"
+      IFMAC=$(docker inspect -f $TMP)
+      [ "$IFMAC" != "" ] && break
+        sleep 1
+      RETRIES=$((RETRIES - 1))
+    done
+  fi
+  [ "$IFMAC" = "<no value>" ] && IFMAC=0
+  [ "$IFMAC" = "" ] && IFMAC=0
+  
+  echo "$IFMAC"
+}
+
+# get container mac
+IFMAC=$(guest_mac "$DOCKER_NET" "$GUESTNAME")
+[ "$IFMAC" = "0" ] && {
+  [ "$4" ] || {
+    die 1 "$GUESTNAME is not connect to network $DOCKER_NET"
+  }
+
+  docker network connect $DOCKER_NET $GUESTNAME
+  IFMAC=$(guest_mac "$DOCKER_NET" "$GUESTNAME")
+}
+
+[ "$IFMAC" = "0" ] && {
+  die 1 "Get $GUESTNAME Mac failed"
+}
+
+# get container ifname
+IFNAME=$($NSENTER ip -o link | grep "$IFMAC" | awk  '{print $2}' | awk -F '@' '{print $1}')
+[ "$IFNAME" ] || {
+  die 1 "Get $GUESTNAME ifname failed"
+}
+
+# do job <container-name> ip <network>
+[ "$4" ] || {
+  $NSENTER ip addr show "$IFNAME"
+  exit 0
+}
+
+# do job <container-name> ip <network> flush
+[ "$4" = "flush" ] && {
+  $NSENTER ip addr flush dev "$IFNAME"
+  exit 0
+}
+
+# do job <container-name> ip <network> del
+[ "$4" = "del" ] && {
+  docker network disconnect $DOCKER_NET $GUESTNAME
+  exit 0
+}
+
+# do job <container-name> ip <network> <ip/sub>
+[ "$5" ] || {
+  $NSENTER ip addr add "$4" dev "$IFNAME"
+  exit 0
+}
+
+# do job <container-name> ip <network> <ip/sub> del
+[ "$5"  = "del" ] && {
+  $NSENTER ip addr del "$4" dev "$IFNAME"
+  exit 0
+}
